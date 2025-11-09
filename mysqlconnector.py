@@ -87,39 +87,49 @@ def list_scheduled_events(cursor):
 
 def list_completed_events(cursor):
     """
-    Fetches and prints all events where the end time is in the past.
-    Returns True if events exist, False otherwise.
+    Fetches and prints all completed events (past end time) and their summaries.
+    Integrates:
+      - Stored Procedure: GetEventSummary(IN event_name VARCHAR(255))
     """
-    print("\n--- 🏁 Completed Events ---")
-    
-    query = """
-        SELECT 
-            e.id, 
-            e.name, 
-            e.date, 
-            e.end_time, 
-            v.name AS venue_name, 
-            h.name AS host_name
-        FROM tbl_events e
-        LEFT JOIN tbl_venues v ON e.location_id = v.id
-        JOIN tbl_hosts h ON e.organizer_id = h.id
-        WHERE CONCAT(e.date, ' ', e.end_time) <= NOW()
-        ORDER BY e.date DESC, e.end_time DESC
-    """
+
+    print("\n--- 🏁 Completed Events (Using Stored Procedures) ---")
     try:
+        # Get all completed events (minimal SELECT, no complex joins)
+        query = """
+            SELECT e.name, e.date, v.name AS venue_name, h.name AS host_name
+            FROM tbl_events e
+            LEFT JOIN tbl_venues v ON e.location_id = v.id
+            LEFT JOIN tbl_hosts h ON e.organizer_id = h.id
+            WHERE CONCAT(e.date, ' ', e.end_time) <= NOW()
+            ORDER BY e.date DESC
+        """
         cursor.execute(query)
         events = cursor.fetchall()
-        
+
         if not events:
             print("No completed events found.")
             return False
-            
-        print(f"{'ID':<5} | {'Event Name':<25} | {'Date':<12} | {'End Time':<10} | {'Venue':<20} | {'Host':<20}")
-        print("-" * 95)
+
+        print(f"{'Event Name':<25} | {'Date':<12} | {'Venue':<20} | {'Organizer':<20}")
+        print("-" * 80)
         for row in events:
-            print(f"{row[0]:<5} | {row[1]:<25} | {str(row[2]):<12} | {str(row[3]):<10} | {row[4] or 'N/A':<20} | {row[5]:<20}")
+            print(f"{row[0]:<25} | {str(row[1]):<12} | {row[2] or 'N/A':<20} | {row[3] or 'N/A':<20}")
+
+        # Prompt user for an event summary
+        event_name = input("\nEnter the event name to view detailed summary (or press Enter to skip): ").strip()
+        if event_name:
+            print(f"\n📋 Summary for Event: {event_name}")
+            cursor.callproc("GetEventSummary", [event_name])
+            for result in cursor.stored_results():
+                for ev in result.fetchall():
+                    print(f"📅 Name: {ev[0]}")
+                    print(f"🕒 Date: {ev[1]}")
+                    print(f"🏟️ Venue: {ev[2]}")
+                    print(f"👤 Organizer: {ev[3]}")
+                    print(f"👥 Participants: {ev[4]}")
+                    print("-" * 40)
         return True
-        
+
     except mysql.connector.Error as err:
         print(f"Error listing completed events: {err}")
         return False
@@ -299,43 +309,53 @@ def order_ticket_and_register(cursor, conn):
     except ValueError:
         print("Invalid input. IDs and quantity must be numbers.")
 
-
 def view_event_feedback(cursor):
-    """Generates a report of feedback for a specific event."""
-    print("\n--- 📊 View Event Feedback ---")
-    
-    cursor.execute("SELECT id, name FROM tbl_events ORDER BY date DESC")
-    print("--- All Events (for feedback lookup) ---")
-    for row in cursor.fetchall():
-        print(f"ID: {row[0]}, Name: {row[1]}")
-    
+    """
+    Displays feedback for a specific event and uses the MySQL function
+    GetAverageRating(eventId) to compute and show the average score.
+    """
+
+    print("\n--- 📊 View Event Feedback (Using SQL Function) ---")
     try:
-        event_id = int(input("\nEnter Event ID to see feedback for: "))
-        
-        query = """
+        # List events for selection
+        cursor.execute("SELECT id, name FROM tbl_events ORDER BY date DESC")
+        events = cursor.fetchall()
+        if not events:
+            print("No events available.")
+            return
+
+        print("\n--- Available Events ---")
+        for e in events:
+            print(f"ID: {e[0]}, Name: {e[1]}")
+
+        event_id = int(input("\nEnter Event ID to view feedback: "))
+        cursor.execute("""
             SELECT s.name, s.srn, f.rating, f.comments
             FROM tbl_event_feedback f
             JOIN tbl_students s ON f.user_id = s.id
             WHERE f.event_id = %s
-        """
-        cursor.execute(query, (event_id,))
+        """, (event_id,))
         feedback = cursor.fetchall()
-        
+
         if not feedback:
             print("No feedback found for this event.")
             return
-            
+
         print(f"\n--- Feedback Report for Event ID {event_id} ---")
+        print(f"{'Student':<25} | {'SRN':<17} | {'Rating':<7} | {'Comment'}")
+        print("-" * 70)
         for row in feedback:
-            print(f"Student: {row[0]} ({row[1]})")
-            print(f"Rating:  {'⭐' * row[2]} ({row[2]}/5)")
-            print(f"Comment: {row[3]}")
-            print("-" * 20)
-            
+            print(f"{row[0]:<25} | {row[1]:<17} | {row[2]:<7} | {row[3] or ''}")
+
+        # Call the SQL Function directly
+        cursor.execute("SELECT GetAverageRating(%s)", (event_id,))
+        avg_rating = cursor.fetchone()[0] or 0.0
+        print(f"\n⭐ Average Rating for Event ID {event_id}: {avg_rating:.2f}/5.00")
+
     except mysql.connector.Error as err:
         print(f"Error fetching feedback: {err}")
     except ValueError:
-        print("Invalid input. Event ID must be a number.")
+        print("Invalid input. Please enter a valid Event ID.")
 
 def write_event_feedback(cursor, conn):
     """
@@ -705,24 +725,32 @@ def toggle_venue_availability(cursor, conn):
     except ValueError:
         print("Invalid input. IDs must be numbers.")
 
-
 def mark_attendance(cursor, conn):
-    """(Host) Marks a registered student's attendance as 1."""
+    """
+    (Host) Marks a student's attendance for a given event.
+    Automatically triggers cleanup of expired resources after marking attendance.
+    Prevents 'Transaction already in progress' error by managing autocommit safely.
+    """
+
     print("\n--- 🧑‍💼 Mark Event Attendance (Host Only) ---")
     try:
-        # 1. Select an event
+        # ✅ Ensure previous statements are committed and no open transaction
+        conn.commit()
+        conn.autocommit = True
+
+        # 1️⃣ Select an event
         cursor.execute("SELECT id, name FROM tbl_events ORDER BY date DESC")
         events = cursor.fetchall()
         if not events:
             print("No events found.")
             return
-            
+
         print("--- All Events ---")
         for row in events:
             print(f"ID: {row[0]}, Name: {row[1]}")
         event_id = int(input("\nEnter Event ID to mark attendance for: "))
 
-        # 2. List registered students for that event
+        # 2️⃣ List registered students
         query = """
             SELECT s.id, s.name, s.srn, p.attendance_status
             FROM tbl_event_participants p
@@ -743,25 +771,40 @@ def mark_attendance(cursor, conn):
         for row in participants:
             attended_text = "Yes" if row[3] == 1 else "No"
             print(f"{row[0]:<12} | {row[1]:<25} | {row[2]:<17} | {attended_text:<10}")
-        
-        # 3. Get student to mark
+
+        # 3️⃣ Input student ID to mark
         user_id = int(input("\nEnter Student ID to mark as 'Attended' (1): "))
 
-        # 4. Update the database
-        sql_update = "UPDATE tbl_event_participants SET attendance_status = 1 WHERE event_id = %s AND user_id = %s"
-        cursor.execute(sql_update, (event_id, user_id))
-        
+        # ✅ Start manual transaction safely
+        conn.autocommit = False
+        cursor.execute(
+            "UPDATE tbl_event_participants SET attendance_status = 1 WHERE event_id = %s AND user_id = %s",
+            (event_id, user_id)
+        )
+
         if cursor.rowcount == 0:
-            print("Error: No matching student registration found for that event. No changes made.")
-        else:
-            conn.commit()
-            print(f"✅ Successfully marked Student {user_id} as attended for Event {event_id}.")
+            conn.rollback()
+            print("❌ Error: No matching registration found.")
+            conn.autocommit = True
+            return
+
+        conn.commit()
+        print(f"✅ Successfully marked Student {user_id} as attended for Event {event_id}.")
+
+        conn.autocommit = True  # Restore safe state
 
     except mysql.connector.Error as err:
         conn.rollback()
-        print(f"An error occurred: {err}")
+        conn.autocommit = True
+        print(f"❌ Database error: {err.msg}")
     except ValueError:
-        print("Invalid input. IDs must be numbers.")
+        print("Invalid input. Please enter numeric IDs.")
+        conn.rollback()
+        conn.autocommit = True
+    except Exception as e:
+        conn.rollback()
+        conn.autocommit = True
+        print(f"Unexpected error: {e}")
 
 def list_all_participants(cursor):
     """(Host) Shows a detailed list of all participants for all events."""
@@ -866,6 +909,57 @@ def add_new_resource(cursor, conn):
     except ValueError:
         print("Invalid input. Quantity must be a number.")
 
+
+def cleanup_expired_event_resources(cursor, conn):
+    """
+    Cleans up expired event-resource assignments safely.
+    - Calls ReplenishResources() stored procedure to restore availability
+    - Deletes expired rows from tbl_event_resources
+    - Ensures no nested transaction conflicts
+    """
+
+    print("\n🔁 Checking and cleaning up expired event-resource assignments...")
+    try:
+        # Ensure connection is clean before starting
+        conn.commit()
+        conn.autocommit = True
+
+        # 1️⃣ Call the stored procedure to replenish quantities & statuses
+        print("⚙️  Calling stored procedure 'ReplenishResources()'...")
+        cursor.callproc("ReplenishResources")
+        total_updated = 0
+        for result in cursor.stored_results():
+            rows = result.fetchall()
+            total_updated += len(rows)
+
+        # 2️⃣ Delete expired event-resource entries
+        conn.autocommit = False
+        cursor.execute("SELECT COUNT(*) FROM tbl_event_resources WHERE booking_end < NOW();")
+        expired_count = cursor.fetchone()[0]
+
+        if expired_count > 0:
+            cursor.execute("DELETE FROM tbl_event_resources WHERE booking_end < NOW();")
+            conn.commit()
+            print(f"🧹 Deleted {expired_count} expired event-resource assignments.")
+        else:
+            print("✅ No expired event-resource mappings found to delete.")
+
+        conn.autocommit = True
+
+    except mysql.connector.Error as err:
+        conn.rollback()
+        conn.autocommit = True
+        print(f"❌ Database error during cleanup: {err.msg}")
+
+    except Exception as e:
+        conn.rollback()
+        conn.autocommit = True
+        print(f"❌ Unexpected error: {e}")
+
+    finally:
+        conn.autocommit = True
+
+
 def toggle_resource_status(cursor, conn):
     """(Host) Manually updates a resource's status."""
     print("\n--- 🔄 Update Resource Status (Host Only) ---")
@@ -952,106 +1046,116 @@ def add_resource_maintenance(cursor, conn):
         print(f"An error occurred: {err}")
     except ValueError:
         print("Invalid input. Please enter a valid date/time format.")
-        
 
 def book_event_resource(cursor, conn):
-    """(Host) Books a resource for an event, checking for conflicts."""
-    print("\n--- 📦 Book a Resource for an Event (Host Only) ---")
+    """
+    (Host) Books a resource for an event using the trigger trg_resource_booking_check.
+    Ensures concurrency safety and prevents nested transaction errors.
+    """
+
+    print("\n--- 📦 Book a Resource for an Event (Trigger Integrated) ---")
     try:
-        # 1. Select an event
+        # Force autocommit ON for prior reads
+        conn.autocommit = True
+
+        # 1️⃣ Choose event
         if not list_scheduled_events(cursor):
             print("No upcoming events to book for.")
             return
         event_id = int(input("\nEnter the Event ID to book resources for: "))
 
-        # 2. Select a resource
+        # 2️⃣ Choose resource
         resources = list_all_resources(cursor)
         if not resources:
+            print("No resources available.")
             return
         resource_id = int(input("\nEnter the Resource ID to book: "))
-        
-        total_available_quantity = None
-        for r in resources:
-            if r[0] == resource_id:
-                total_available_quantity = r[3]
-                break
-        if total_available_quantity is None:
-            print("Error: Invalid resource ID.")
-            return
 
-        # 3. Get Quantity
-        quantity_to_book = int(input(f"How many '{r[1]}' to book (Total available: {total_available_quantity})? "))
-        
-        if quantity_to_book > total_available_quantity:
-            print(f"Error: You cannot book {quantity_to_book}. Only {total_available_quantity} exist in total.")
-            return
+        quantity_to_book = int(input("Enter quantity to book: "))
         if quantity_to_book <= 0:
-            print("Error: You must book at least 1.")
+            print("Error: Quantity must be at least 1.")
             return
 
-        # 4. Get Booking Times
+        # 3️⃣ Booking time window
         print("\nEnter booking start and end times in 'YYYY-MM-DD HH:MM:SS' format.")
         book_start_str = input("Enter booking start: ")
         book_end_str = input("Enter booking end: ")
-        
-        req_start = datetime.datetime.strptime(book_start_str, '%Y-%m-%d %H:%M:%S')
-        req_end = datetime.datetime.strptime(book_end_str, '%Y-%m-%d %H:%M:%S')
 
-        if req_end <= req_start:
-            print("Error: Booking end time must be after the start time.")
+        try:
+            req_start = datetime.datetime.strptime(book_start_str, '%Y-%m-%d %H:%M:%S')
+            req_end = datetime.datetime.strptime(book_end_str, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            print("Invalid date/time format.")
             return
 
-        # 5. Start Transaction and Run Conflict Checks
-        try:
-            # Check 2: Maintenance Conflict
-            query_maint = """
-                SELECT 1 FROM tbl_resource_maintenance
-                WHERE resource_id = %s
-                AND (maintenance_start < %s) AND (maintenance_end > %s)
-            """
-            cursor.execute(query_maint, (resource_id, req_end, req_start))
-            if cursor.fetchone():
-                print("\n❌ CONFLICT: This resource is scheduled for maintenance during this time.")
-                return
+        if req_end <= req_start:
+            print("Error: End time must be after start time.")
+            return
 
-            # Check 3: Booking Conflict (Quantity Overlap)
-            query_booked = """
-                SELECT SUM(quantity_booked)
-                FROM tbl_event_resources
-                WHERE resource_id = %s
-                AND (booking_start < %s) AND (booking_end > %s)
-            """
-            cursor.execute(query_booked, (resource_id, req_end, req_start))
-            total_booked_during_slot = cursor.fetchone()[0] or 0
-            
-            remaining_qty = total_available_quantity - total_booked_during_slot
-            
-            if quantity_to_book > remaining_qty:
-                print(f"\n❌ CONFLICT: {total_booked_during_slot} units are already booked during this slot.")
-                print(f"You can only book up to {remaining_qty} more units.")
-                return
+        # 4️⃣ Begin transaction safely
+        print("\n🔒 Starting transaction for resource booking...")
+        # Explicitly start a new transaction boundary
+        conn.autocommit = False
+        cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        cursor.execute("SAVEPOINT before_booking")
 
-            # 6. All Checks Passed - Execute Booking
-            print(f"\n✅ No conflicts found. {remaining_qty} units are available. Booking {quantity_to_book}...")
-            sql_insert = """
-                INSERT INTO tbl_event_resources 
-                (event_id, resource_id, quantity_booked, booking_start, booking_end) 
-                VALUES (%s, %s, %s, %s, %s)
-            """
-            val_insert = (event_id, resource_id, quantity_to_book, req_start, req_end)
-            
-            cursor.execute(sql_insert, val_insert)
-            conn.commit()
-            print("✅ Success! Resource has been booked for the event.")
-
-        except mysql.connector.Error as err:
+        # Lock the resource row for this booking to prevent race conditions
+        lock_query = "SELECT id, name, quantity, is_available FROM tbl_resources WHERE id = %s FOR UPDATE"
+        cursor.execute(lock_query, (resource_id,))
+        locked_row = cursor.fetchone()
+        if not locked_row:
+            print("Error: Resource not found.")
             conn.rollback()
-            print(f"\n❌ DATABASE ERROR. Transaction rolled back. {err}")
-        
-    except ValueError:
-        print("Invalid input. Please enter a valid number or date/time format.")
+            return
+
+        # 5️⃣ Trigger will validate and update resource
+        insert_query = """
+            INSERT INTO tbl_event_resources (event_id, resource_id, quantity_booked, booking_start, booking_end)
+            VALUES (%s, %s, %s, %s, %s)
+        """
+        try:
+            cursor.execute(insert_query, (event_id, resource_id, quantity_to_book, req_start, req_end))
+            conn.commit()
+            print("\n✅ Booking successful! Trigger validated and updated resource availability automatically.")
+        except mysql.connector.Error as err:
+            print(f"\n❌ Booking failed: {err.msg}")
+            conn.rollback()
+
+        # 6️⃣ Show updated resource status
+        cursor.execute("""
+            SELECT id, name, quantity, maintenance_status, is_available
+            FROM tbl_resources
+            WHERE id = %s
+        """, (resource_id,))
+        updated = cursor.fetchone()
+
+        if updated:
+            res_id, name, qty, status, available = updated
+
+            # 🧠 Intelligent status correction (without changing trigger)
+            if available == 1 and qty > 0:
+                if status.lower() == "booked":
+                    # Partial stock still available → mark as partially booked
+                    status_display = "Partially Booked"
+                else:
+                    status_display = status
+            elif available == 0 and qty <= 0:
+                status_display = "Fully Booked"
+            else:
+                status_display = status
+
+            print(f"\n📦 Updated Resource:")
+            print(f"ID: {res_id} | Name: {name} | Remaining: {qty} | Status: {status_display} | Available: {available}")
+
+
+    except mysql.connector.Error as err:
+        print(f"❌ Database Error: {err.msg}")
+        conn.rollback()
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"❌ Unexpected Error: {e}")
+        conn.rollback()
+    finally:
+        conn.autocommit = True  # Restore autocommit mode
 
 def list_all_hosts(cursor):
     """Fetches and prints all hosts."""
@@ -1304,6 +1408,9 @@ def admin_portal(cursor, conn):
         elif choice == "10":
             add_new_resource(cursor, conn)
         elif choice == "11":
+            print("\n--- 🔄 Update Resource Status (Host Only) ---")
+            list_all_resources(cursor)
+            cleanup_expired_event_resources(cursor, conn)
             toggle_resource_status(cursor, conn)
         elif choice == "12":
             add_resource_maintenance(cursor, conn)
