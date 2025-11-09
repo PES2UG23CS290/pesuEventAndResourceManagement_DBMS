@@ -1330,7 +1330,7 @@ def main():
             host="localhost",
             user="root",
             password="root",  # <-- IMPORTANT: Change to your MySQL password
-            database="pesu_project" # Make sure this matches your database name
+            database="pesu_proj" # Make sure this matches your database name
         )
         cursor = conn.cursor()
         print("\n✅ Successfully connected to 'pesu_project'")
