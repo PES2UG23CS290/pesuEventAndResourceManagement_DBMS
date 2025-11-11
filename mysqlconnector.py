@@ -1359,7 +1359,7 @@ def main():
         elif choice == "2":
             admin_portal(cursor, conn)
         elif choice == "3":
-            view_event_feedback(cursor) # Public can view feedback
+            view_event_feedback(cursor) # Public can view feedback1
         elif choice == "0":
             print("Exiting Program...")
             break
